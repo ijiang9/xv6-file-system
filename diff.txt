@@ -1,0 +1,425 @@
+Only in xv6-public-master: .DS_Store
+diff -uw xv62/Makefile xv6-public-master/Makefile
+--- xv62/Makefile	2019-11-21 15:01:54.000000000 -0600
++++ xv6-public-master/Makefile	2019-10-27 22:33:49.000000000 -0500
+@@ -181,8 +181,6 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
+-	_mkSFdir\
+-        _test\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -252,7 +250,7 @@
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+ 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
+-	printf.c umalloc.c mkSFdir.c test.c\
++	printf.c umalloc.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+ 
+Only in xv6-public-master: bootasm.d
+Only in xv6-public-master: bootasm.o
+Only in xv6-public-master: bootmain.d
+Only in xv6-public-master: bootmain.o
+diff -uw xv62/fs.c xv6-public-master/fs.c
+--- xv62/fs.c	2019-11-23 22:28:20.000000000 -0600
++++ xv6-public-master/fs.c	2018-09-02 05:33:54.000000000 -0500
+@@ -376,16 +376,13 @@
+   uint addr, *a;
+   struct buf *bp;
+ 
+-  if (ip->type == T_SMALLFILE)
+-    return -1;
+   if(bn < NDIRECT){
+     if((addr = ip->addrs[bn]) == 0)
+       ip->addrs[bn] = addr = balloc(ip->dev);
+     return addr;
+   }
+   bn -= NDIRECT;
+-  if(ip->type==T_SMALLFILE)
+-     return -1;
++
+   if(bn < NINDIRECT){
+     // Load indirect block, allocating if necessary.
+     if((addr = ip->addrs[NDIRECT]) == 0)
+@@ -469,42 +466,16 @@
+     return -1;
+   if(off + n > ip->size)
+     n = ip->size - off;
+-  if(ip->type == T_SMALLFILE){
+-     memmove(dst, (char*)(ip->addrs)+off,n);
+-  }else{
++
+   for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
+     bp = bread(ip->dev, bmap(ip, off/BSIZE));
+     m = min(n - tot, BSIZE - off%BSIZE);
+     memmove(dst, bp->data + off%BSIZE, m);
+     brelse(bp);
+   }
+-  }
+   return n;
+ }
+ 
+-void 
+-toNormal(struct inode *ip) {
+-  char buff[ip->size];
+-  struct buf *bp;
+-  if(ip->type == T_FILE) {
+-    return;
+-  }
+-  ip->type = T_FILE;
+-  memmove(buff, (uchar*)ip->addrs, ip->size);
+-  //chean the assres
+-  memset(ip->addrs, 0, ip->size * sizeof(int));
+-
+-  bp= bread(ip->dev, bmap(ip, 0));
+-  
+-  memmove(bp->data, buff, ip->size);
+-  log_write(bp);
+-  brelse(bp);
+-  
+-  iupdate(ip); 
+-  return;
+-}
+-
+-
+ // PAGEBREAK!
+ // Write data to inode.
+ // Caller must hold ip->lock.
+@@ -514,7 +485,6 @@
+   uint tot, m;
+   struct buf *bp;
+   
+-
+   if(ip->type == T_DEV){
+     if(ip->major < 0 || ip->major >= NDEV || !devsw[ip->major].write)
+       return -1;
+@@ -525,22 +495,7 @@
+     return -1;
+   if(off + n > MAXFILE*BSIZE)
+     return -1;
+-  if(ip->type==T_SMALLFILE && off+n<=52){
+-     memmove((uchar*)ip->addrs+off,src,n);
+-     off+=n;
+-  }else{
+-     if(ip->type==T_SMALLFILE && off+n>52){
+-       cprintf("Buffer is too big...\n");
+-       cprintf("converting small file to normal file...\n");
+-       toNormal(ip);
+-       for(tot=0; tot<n; tot+=m, off+=m, src+=m){
+-          bp = bread(ip->dev, bmap(ip, off/BSIZE));
+-          m = min(n - tot, BSIZE - off%BSIZE);
+-          memmove(bp->data + off%BSIZE, src, m);
+-          log_write(bp);
+-          brelse(bp);
+-        }
+-     }else{
++
+        for(tot=0; tot<n; tot+=m, off+=m, src+=m){
+           bp = bread(ip->dev, bmap(ip, off/BSIZE));
+           m = min(n - tot, BSIZE - off%BSIZE);
+@@ -548,8 +503,6 @@
+           log_write(bp);
+           brelse(bp);
+         }
+-      }
+-   }
+ 
+   if(n > 0 && off > ip->size){
+     ip->size = off;
+@@ -558,7 +511,6 @@
+   return n;
+ }
+ 
+-
+ //PAGEBREAK!
+ // Directories
+ 
+@@ -576,7 +528,7 @@
+   uint off, inum;
+   struct dirent de;
+ 
+-  if(dp->type != T_DIR && dp->type !=T_SFDIR)
++  if(dp->type != T_DIR)
+     panic("dirlookup not DIR");
+ 
+   for(off = 0; off < dp->size; off += sizeof(de)){
+@@ -682,7 +634,7 @@
+ 
+   while((path = skipelem(path, name)) != 0){
+     ilock(ip);
+-    if(ip->type != T_DIR && ip->type !=T_SFDIR){
++    if(ip->type != T_DIR){
+       iunlockput(ip);
+       return 0;
+     }
+diff -uw xv62/ls.c xv6-public-master/ls.c
+--- xv62/ls.c	2019-11-21 14:21:38.000000000 -0600
++++ xv6-public-master/ls.c	2018-09-02 05:33:54.000000000 -0500
+@@ -46,10 +46,6 @@
+     printf(1, "%s %d %d %d\n", fmtname(path), st.type, st.ino, st.size);
+     break;
+ 
+-  case T_SMALLFILE:
+-    printf(1, "%s %d %d %d\n", fmtname(path), st.type, st.ino, st.size);
+-    break;
+-
+   case T_DIR:
+     if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf){
+       printf(1, "ls: path too long\n");
+@@ -70,28 +66,6 @@
+       printf(1, "%s %d %d %d\n", fmtname(buf), st.type, st.ino, st.size);
+     }
+     break;
+-  
+-  
+-  case T_SFDIR:
+-    if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf){
+-      printf(1, "ls: path too long\n");
+-      break;
+-    }
+-    strcpy(buf, path);
+-    p = buf+strlen(buf);
+-    *p++ = '/';
+-    while(read(fd, &de, sizeof(de)) == sizeof(de)){
+-      if(de.inum == 0)
+-        continue;
+-      memmove(p, de.name, DIRSIZ);
+-      p[DIRSIZ] = 0;
+-      if(stat(buf, &st) < 0){
+-        printf(1, "ls: cannot stat %s\n", buf);
+-        continue;
+-      }
+-      printf(1, "%s %d %d %d\n", fmtname(buf), st.type, st.ino, st.size);
+-    }
+-    break;
+   }
+   close(fd);
+ }
+Only in xv62: mkSFdir.c
+diff -uw xv62/mkfs.c xv6-public-master/mkfs.c
+--- xv62/mkfs.c	2019-11-21 14:22:08.000000000 -0600
++++ xv6-public-master/mkfs.c	2018-09-02 05:33:54.000000000 -0500
+@@ -116,8 +116,6 @@
+ 
+   rootino = ialloc(T_DIR);
+   assert(rootino == ROOTINO);
+- // rootino = ialloc(T_SFDIR);
+- // assert(rootino == ROOTINO);
+ 
+   bzero(&de, sizeof(de));
+   de.inum = xshort(rootino);
+diff -uw xv62/stat.h xv6-public-master/stat.h
+--- xv62/stat.h	2019-11-21 12:18:06.000000000 -0600
++++ xv6-public-master/stat.h	2018-09-02 05:33:54.000000000 -0500
+@@ -2,9 +2,6 @@
+ #define T_FILE 2   // File
+ #define T_DEV  3   // Device
+ 
+-#define T_SMALLFILE 5 //Small File
+-#define T_SFDIR 4  // Directory for small files
+-
+ struct stat {
+   short type;  // Type of file
+   int dev;     // File system's disk device
+diff -uw xv62/syscall.c xv6-public-master/syscall.c
+--- xv62/syscall.c	2019-11-21 12:13:02.000000000 -0600
++++ xv6-public-master/syscall.c	2018-09-02 05:33:54.000000000 -0500
+@@ -103,8 +103,6 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
+-//new mkSFdir
+-extern int sys_mkSFdir(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -128,7 +126,6 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
+-[SYS_mkSFdir] sys_mkSFdir,
+ };
+ 
+ void
+diff -uw xv62/syscall.h xv6-public-master/syscall.h
+--- xv62/syscall.h	2019-11-21 12:13:36.000000000 -0600
++++ xv6-public-master/syscall.h	2018-09-02 05:33:54.000000000 -0500
+@@ -20,4 +20,3 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
+-#define SYS_mkSFdir 22
+diff -uw xv62/sysfile.c xv6-public-master/sysfile.c
+--- xv62/sysfile.c	2019-11-23 19:18:20.000000000 -0600
++++ xv6-public-master/sysfile.c	2018-09-02 05:33:54.000000000 -0500
+@@ -16,11 +16,8 @@
+ #include "file.h"
+ #include "fcntl.h"
+ 
+-
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+-
+-
+ static int
+ argfd(int n, int *pfd, struct file **pf)
+ {
+@@ -134,7 +131,7 @@
+   }
+ 
+   ilock(ip);
+-  if(ip->type == T_DIR || ip->type == T_SFDIR){
++  if(ip->type == T_DIR){
+     iunlockput(ip);
+     end_op();
+     return -1;
+@@ -146,11 +143,6 @@
+ 
+   if((dp = nameiparent(new, name)) == 0)
+     goto bad;
+-
+-  if (dp->type == T_DIR && ip->type == T_SMALLFILE){
+-    cprintf("Normal directory link to small file is not allowed...\n");
+-    goto bad;
+-  }
+   ilock(dp);
+   if(dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0){
+     iunlockput(dp);
+@@ -218,7 +210,7 @@
+ 
+   if(ip->nlink < 1)
+     panic("unlink: nlink < 1");
+-  if((ip->type == T_DIR || ip->type == T_SFDIR) && !isdirempty(ip)){
++  if(ip->type == T_DIR && !isdirempty(ip)){
+     iunlockput(ip);
+     goto bad;
+   }
+@@ -226,7 +218,7 @@
+   memset(&de, 0, sizeof(de));
+   if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
+     panic("unlink: writei");
+-  if(ip->type == T_DIR || ip->type == T_SFDIR){
++  if(ip->type == T_DIR){
+     dp->nlink--;
+     iupdate(dp);
+   }
+@@ -260,7 +252,7 @@
+   if((ip = dirlookup(dp, name, &off)) != 0){
+     iunlockput(dp);
+     ilock(ip);
+-    if((type == T_FILE && ip->type == T_FILE)||(type == T_SMALLFILE && ip->type == T_SMALLFILE))
++    if(type == T_FILE && ip->type == T_FILE)
+       return ip;
+     iunlockput(ip);
+     return 0;
+@@ -275,7 +267,7 @@
+   ip->nlink = 1;
+   iupdate(ip);
+ 
+-  if(type == T_DIR || type==T_SFDIR){  // Create . and .. entries.
++  if(type == T_DIR){  // Create . and .. entries.
+     dp->nlink++;  // for ".."
+     iupdate(dp);
+     // No ip->nlink++ for ".": avoid cyclic ref count.
+@@ -299,34 +291,13 @@
+   struct file *f;
+   struct inode *ip;
+   
+-
+   if(argstr(0, &path) < 0 || argint(1, &omode) < 0)
+     return -1;
+ 
+   begin_op();
+ 
+-  int n=sizeof(path);
+-  int i;
+-  char subbuff[5];
+-  
+-  for(i=0; i<n; i++){
+-     if(path[i]=='/'){
+-      break;
+-     }
+-     subbuff[i]=path[i];
+-  }
+-  
+-  
+-  subbuff[i] = '\0';
+-
+-  ip=namei(subbuff);
+-
+   if(omode & O_CREATE){
+-    if(ip->type==T_SFDIR){
+-      ip=create(path, T_SMALLFILE,0,0);
+-    }else{
+       ip = create(path, T_FILE, 0, 0);
+-    }
+     if(ip == 0){
+       end_op();
+       return -1;
+@@ -337,7 +308,7 @@
+       return -1;
+     }
+     ilock(ip);
+-    if((ip->type == T_DIR || ip->type == T_SFDIR) && omode != O_RDONLY){
++    if(ip->type == T_DIR && omode != O_RDONLY){
+       iunlockput(ip);
+       end_op();
+       return -1;
+@@ -378,24 +349,6 @@
+   return 0;
+ }
+ 
+-
+-
+-int
+-sys_mkSFdir(void)
+-{
+-  char *path;
+-  struct inode *ip;
+-
+-  begin_op();
+-  if(argstr(0, &path) < 0 || (ip = create(path, T_SFDIR, 0, 0)) == 0){
+-    end_op();
+-    return -1;
+-  }
+-  iunlockput(ip);
+-  end_op();
+-  return 0;
+-}
+-
+ int
+ sys_mknod(void)
+ {
+@@ -429,7 +382,7 @@
+     return -1;
+   }
+   ilock(ip);
+-  if(ip->type != T_DIR && ip->type != T_SFDIR){
++  if(ip->type != T_DIR){
+     iunlockput(ip);
+     end_op();
+     return -1;
+Only in xv62: test.c
+diff -uw xv62/user.h xv6-public-master/user.h
+--- xv62/user.h	2019-11-21 12:14:14.000000000 -0600
++++ xv6-public-master/user.h	2018-09-02 05:33:54.000000000 -0500
+@@ -23,7 +23,6 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+-int mkSFdir(const char*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff -uw xv62/usys.S xv6-public-master/usys.S
+--- xv62/usys.S	2019-11-21 12:14:44.000000000 -0600
++++ xv6-public-master/usys.S	2018-09-02 05:33:54.000000000 -0500
+@@ -29,4 +29,3 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
+-SYSCALL(mkSFdir)
